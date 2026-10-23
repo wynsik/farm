@@ -1,6 +1,10 @@
 local Players = game:GetService("Players")
 local PathfindingService = game:GetService("PathfindingService")
 local GuiService = game:GetService("GuiService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
@@ -12,28 +16,103 @@ while not player do
     player = Players.LocalPlayer
 end
 
-local INTERVAL = 600 -- дорожка: 10 минут
+----------------------------------------------------------------
+-- АВТО-СМЕНА СЕРВЕРА, если зашёл нежелательный игрок
+----------------------------------------------------------------
+local BLOCKED_NAMES = {"tommy_boblox"} -- маленькими буквами, можно добавлять ещё
+
+local function isBlocked(pl)
+    local n = pl.Name:lower()
+    local d = pl.DisplayName:lower()
+    for _, b in ipairs(BLOCKED_NAMES) do
+        if n == b or d == b then return true end
+    end
+    return false
+end
+
+local hopping = false
+local function serverHop()
+    if hopping then return end
+    hopping = true
+
+    local ok = pcall(function()
+        local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
+            .. "/servers/Public?sortOrder=Asc&limit=100"
+        local data = HttpService:JSONDecode(game:HttpGet(url))
+
+        local list = {}
+        for _, s in ipairs(data.data) do
+            if s.id ~= game.JobId and s.playing < s.maxPlayers - 1 then
+                table.insert(list, s.id)
+            end
+        end
+
+        if #list == 0 then error("нет серверов") end
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, list[math.random(#list)], player)
+    end)
+
+    if not ok then
+        TeleportService:Teleport(game.PlaceId, player)
+    end
+
+    task.delay(10, function() hopping = false end)
+end
+
+for _, pl in ipairs(Players:GetPlayers()) do
+    if pl ~= player and isBlocked(pl) then serverHop() end
+end
+
+Players.PlayerAdded:Connect(function(pl)
+    if isBlocked(pl) then serverHop() end
+end)
+
+----------------------------------------------------------------
+-- НАСТРОЙКИ
+----------------------------------------------------------------
+local INTERVAL = 600 -- дорожка: слезть и залезть раз в 10 минут
 local ACTION_RUN = "Бежать"
 local ACTION_STOP = "Остановиться"
 local ACTION_SHIFT = "Начать смену"
 
+-- Высота полёта такси над дорогой (в стадах)
+local FLY_HEIGHT = 3
+
 -- Если знаешь точное имя кнопки машины слева, впиши сюда, например "CarButton"
 local CAR_BUTTON_NAME = nil
 
--- Надписи над точками такси
-local TAXI_TEXT = {"ассажир", "ысад", "азнач", "твез", "оставь", "ъедь", "ункт"}
--- Имена объектов-меток (запасной вариант)
-local MARKER_WORDS = {"pickup", "passenger", "customer", "fare", "клиент", "пассажир", "заказ"}
+-- Подсчёт нафармленного: точное имя статистики в leaderstats/атрибутах (например "EXP")
+local STAT_NAME = nil
+local STAT_WORDS = {"exp", "xp", "опыт", "Опыт", "хп", "ХП", "hp", "сила", "Сила", "strength", "power"}
+-- Если статистику найти не удалось, считаем по оценке: столько за секунду на дорожке
+local EXP_PER_SECOND = 40
+
+-- Запасные слова для надписей над точками такси
+local TAXI_TEXT = {"подъедь", "остановись", "Забери", "Высади", "Отвези", "Довези"}
 -- Как может называться кнопка машины
 local CAR_PATTERNS_LATIN = {"%f[%a]cars?%f[%A]", "vehicle", "garage", "spawn"}
 local CAR_PATTERNS_PLAIN = {"машин", "авто", "гараж", "спавн"}
 
+----------------------------------------------------------------
+-- СОСТОЯНИЕ
+----------------------------------------------------------------
 local enabled = true
 local mode = "treadmill" -- "treadmill" или "taxi"
+local flyMode = true     -- true = летим, false = едем по земле
 local cycleId = 0
 local cyclesCompleted = 0
 
--- Удаляем ВСЕ старые меню
+local totalFarmed = 0
+local farmInfo = {on = false, src = "оценка " .. EXP_PER_SECOND .. "/сек"}
+
+local function fmt(n)
+    local s = tostring(math.floor(n or 0))
+    local r = s:reverse():gsub("(%d%d%d)", "%1 "):reverse()
+    return (r:gsub("^%s+", ""))
+end
+
+----------------------------------------------------------------
+-- МЕНЮ
+----------------------------------------------------------------
 for _, name in ipairs({"TreadmillAutoFarm", "AutoTreadmill"}) do
     pcall(function()
         local o = game:GetService("CoreGui"):FindFirstChild(name)
@@ -45,55 +124,271 @@ for _, name in ipairs({"TreadmillAutoFarm", "AutoTreadmill"}) do
     end)
 end
 
+local THEME = {
+    bg      = Color3.fromRGB(22, 20, 34),
+    bar     = Color3.fromRGB(34, 30, 54),
+    card    = Color3.fromRGB(38, 34, 58),
+    accent  = Color3.fromRGB(124, 77, 255),
+    accent2 = Color3.fromRGB(70, 60, 110),
+    text    = Color3.fromRGB(240, 238, 250),
+    sub     = Color3.fromRGB(165, 160, 190),
+    good    = Color3.fromRGB(60, 180, 110),
+    warn    = Color3.fromRGB(230, 150, 50),
+}
+
+local FULL_HEIGHT = 352
+local BAR_HEIGHT = 36
+local WIDTH = 300
+
 local gui = Instance.new("ScreenGui")
 gui.Name = "TreadmillAutoFarm"
 gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 if not pcall(function() gui.Parent = game:GetService("CoreGui") end) or not gui.Parent then
     gui.Parent = player:WaitForChild("PlayerGui")
 end
 
-local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(280, 284)
-frame.Position = UDim2.new(0.5, -140, 0, 20)
-frame.BackgroundColor3 = Color3.fromRGB(28, 25, 40)
-frame.BorderSizePixel = 0
-frame.Active = true
-frame.Draggable = true
-frame.Parent = gui
-Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+local function newCorner(obj, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r)
+    c.Parent = obj
+end
 
-local function makeButton(text, y, height)
+local function newPadding(obj, l, r)
+    local p = Instance.new("UIPadding")
+    p.PaddingLeft = UDim.new(0, l)
+    p.PaddingRight = UDim.new(0, r)
+    p.Parent = obj
+end
+
+local frame = Instance.new("Frame")
+frame.Name = "Window"
+frame.Size = UDim2.fromOffset(WIDTH, FULL_HEIGHT)
+frame.Position = UDim2.new(0.5, -WIDTH / 2, 0, 24)
+frame.BackgroundColor3 = THEME.bg
+frame.BorderSizePixel = 0
+frame.ClipsDescendants = true
+frame.Parent = gui
+newCorner(frame, 12)
+
+local stroke = Instance.new("UIStroke")
+stroke.Color = THEME.accent
+stroke.Thickness = 1.5
+stroke.Transparency = 0.35
+stroke.Parent = frame
+
+local uiScale = Instance.new("UIScale")
+uiScale.Scale = 1
+uiScale.Parent = frame
+
+local bar = Instance.new("Frame")
+bar.Name = "Bar"
+bar.Size = UDim2.new(1, 0, 0, BAR_HEIGHT)
+bar.BackgroundColor3 = THEME.bar
+bar.BorderSizePixel = 0
+bar.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Size = UDim2.new(1, -110, 1, 0)
+title.Position = UDim2.fromOffset(12, 0)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextColor3 = THEME.text
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "AUTO TREADMILL + TAXI"
+title.Parent = bar
+
+local function barButton(text, xFromRight)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(1, -20, 0, height)
-    b.Position = UDim2.fromOffset(10, y)
-    b.BackgroundColor3 = Color3.fromRGB(90, 55, 150)
-    b.TextColor3 = Color3.new(1, 1, 1)
-    b.TextSize = 13
-    b.Font = Enum.Font.GothamSemibold
-    b.Text = text
+    b.Size = UDim2.fromOffset(28, 24)
+    b.AnchorPoint = Vector2.new(1, 0.5)
+    b.Position = UDim2.new(1, -xFromRight, 0.5, 0)
+    b.BackgroundColor3 = THEME.accent2
     b.BorderSizePixel = 0
-    b.TextWrapped = true
-    b.Parent = frame
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 12
+    b.TextColor3 = THEME.text
+    b.Text = text
+    b.Parent = bar
+    newCorner(b, 6)
     return b
 end
 
-local title = makeButton("AUTO TREADMILL + TAXI", 8, 26)
-local status = makeButton("Статус: старт скрипта", 38, 28)
-local debugLabel = makeButton("Диагностика: --", 70, 40)
-local timer = makeButton("Таймер: --:--", 114, 26)
-local cyclesLabel = makeButton("Циклы: 0", 144, 26)
-local modeButton = makeButton("Режим: Дорожка", 176, 28)
-local dumpButton = makeButton("ДАМП (скопировать отчёт)", 208, 28)
-local toggle = makeButton("ПАУЗА", 240, 32)
+local minButton = barButton("–", 8)
+local bigButton = barButton("A+", 40)
+local smallButton = barButton("A-", 72)
 
-for _, b in ipairs({title, status, debugLabel, timer, cyclesLabel}) do
-    b.Active = false
-    b.AutoButtonColor = false
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.BackgroundTransparency = 1
+body.Position = UDim2.fromOffset(0, BAR_HEIGHT)
+body.Size = UDim2.new(1, 0, 1, -BAR_HEIGHT)
+body.Parent = frame
+
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 10)
+pad.PaddingBottom = UDim.new(0, 10)
+pad.PaddingLeft = UDim.new(0, 10)
+pad.PaddingRight = UDim.new(0, 10)
+pad.Parent = body
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = body
+
+local function newLabel(parent, text, size, order)
+    local l = Instance.new("TextLabel")
+    l.BackgroundColor3 = THEME.card
+    l.BorderSizePixel = 0
+    l.Font = Enum.Font.GothamMedium
+    l.TextSize = 13
+    l.TextColor3 = THEME.text
+    l.TextWrapped = true
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Text = text
+    l.Size = size
+    l.LayoutOrder = order or 0
+    l.Parent = parent
+    newCorner(l, 8)
+    newPadding(l, 10, 10)
+    return l
 end
+
+local function newButton(parent, text, size, color, order)
+    local b = Instance.new("TextButton")
+    b.BackgroundColor3 = color
+    b.BorderSizePixel = 0
+    b.AutoButtonColor = true
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 13
+    b.TextColor3 = THEME.text
+    b.TextWrapped = true
+    b.Text = text
+    b.Size = size
+    b.LayoutOrder = order or 0
+    b.Parent = parent
+    newCorner(b, 8)
+    return b
+end
+
+local function newRow(height, order)
+    local r = Instance.new("Frame")
+    r.BackgroundTransparency = 1
+    r.Size = UDim2.new(1, 0, 0, height)
+    r.LayoutOrder = order
+    r.Parent = body
+    return r
+end
+
+-- 1) статус
+local status = newLabel(body, "Статус: старт скрипта", UDim2.new(1, 0, 0, 38), 1)
+
+-- 2) диагностика
+local debugLabel = newLabel(body, "Диагностика: --", UDim2.new(1, 0, 0, 40), 2)
+debugLabel.TextSize = 12
+debugLabel.TextColor3 = THEME.sub
+
+-- 3) таймер и циклы
+local row1 = newRow(30, 3)
+local timer = newLabel(row1, "Таймер: --:--", UDim2.new(0.5, -3, 1, 0))
+timer.TextSize = 12
+timer.TextTruncate = Enum.TextTruncate.AtEnd
+local cyclesLabel = newLabel(row1, "Циклы: 0", UDim2.new(0.5, -3, 1, 0))
+cyclesLabel.Position = UDim2.new(0.5, 3, 0, 0)
+cyclesLabel.TextSize = 12
+cyclesLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+-- 4) сколько нафармилось
+local farmedLabel = newLabel(body, "Нафармлено: 0", UDim2.new(1, 0, 0, 40), 4)
+farmedLabel.TextSize = 12
+
+local function updateFarmLabel()
+    farmedLabel.Text = string.format(
+        "%s · нафармлено: %s\nисточник: %s",
+        farmInfo.on and "На дорожке" or "Не на дорожке",
+        fmt(totalFarmed),
+        tostring(farmInfo.src)
+    )
+end
+
+-- 5) режим
+local modeButton = newButton(body, "Режим: Дорожка", UDim2.new(1, 0, 0, 36), THEME.accent, 5)
+
+-- 6) езда и дамп
+local row2 = newRow(34, 6)
+local driveButton = newButton(row2, "Езда: полёт", UDim2.new(0.5, -3, 1, 0), THEME.accent2)
+driveButton.TextSize = 12
+local dumpButton = newButton(row2, "ДАМП (скопировать отчёт)", UDim2.new(0.5, -3, 1, 0), THEME.accent2)
+dumpButton.Position = UDim2.new(0.5, 3, 0, 0)
+dumpButton.TextSize = 12
+
+-- 7) пауза
+local toggle = newButton(body, "ПАУЗА", UDim2.new(1, 0, 0, 38), THEME.good, 7)
+
+local function refreshToggleColor()
+    toggle.BackgroundColor3 = (toggle.Text == "ПАУЗА") and THEME.good or THEME.warn
+end
+toggle:GetPropertyChangedSignal("Text"):Connect(refreshToggleColor)
 
 local function setStatus(t) status.Text = "Статус: " .. t end
 
+updateFarmLabel()
+
+-- Управление окном: перетаскивание, свернуть, размер, скрыть
+local dragging = false
+local dragStart, startPos
+
+bar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = frame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        frame.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end
+end)
+
+local minimized = false
+minButton.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    body.Visible = not minimized
+    frame.Size = UDim2.fromOffset(WIDTH, minimized and BAR_HEIGHT or FULL_HEIGHT)
+    minButton.Text = minimized and "+" or "–"
+end)
+
+local function setScale(v)
+    uiScale.Scale = math.clamp(v, 0.6, 1.6)
+end
+bigButton.MouseButton1Click:Connect(function() setScale(uiScale.Scale + 0.1) end)
+smallButton.MouseButton1Click:Connect(function() setScale(uiScale.Scale - 0.1) end)
+
+-- RightShift: спрятать / показать меню
+UserInputService.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode == Enum.KeyCode.RightShift then
+        gui.Enabled = not gui.Enabled
+    end
+end)
+
+----------------------------------------------------------------
+-- ОСНОВНАЯ ЛОГИКА
+----------------------------------------------------------------
 local function main()
     local function getRoot()
         local c = player.Character
@@ -276,6 +571,118 @@ local function main()
         return nil
     end
 
+    ---------------- GUI-хелперы ----------------
+    local function guiVisible(g)
+        local cur = g
+        local pg = player:FindFirstChildOfClass("PlayerGui")
+        while cur and cur ~= pg do
+            if cur:IsA("GuiObject") and not cur.Visible then return false end
+            if cur:IsA("ScreenGui") and not cur.Enabled then return false end
+            cur = cur.Parent
+        end
+        return true
+    end
+
+    local function viewportWidth()
+        local cam = workspace.CurrentCamera
+        return cam and cam.ViewportSize.X or 1000
+    end
+
+    local VIM = nil
+    pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+    local function fireButton(b)
+        if typeof(firesignal) ~= "function" then return false end
+        for _, sig in ipairs({"MouseButton1Click", "Activated"}) do
+            pcall(function() firesignal(b[sig]) end)
+        end
+        return true
+    end
+
+    local function vimClick(b)
+        if not VIM then return false end
+        local inset = 0
+        local sg = b:FindFirstAncestorOfClass("ScreenGui")
+        if sg and not sg.IgnoreGuiInset then
+            inset = GuiService:GetGuiInset().Y
+        end
+        local x = b.AbsolutePosition.X + b.AbsoluteSize.X / 2
+        local y = b.AbsolutePosition.Y + b.AbsoluteSize.Y / 2 + inset
+        pcall(function()
+            VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
+            task.wait(0.05)
+            VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end)
+        return true
+    end
+
+    ---------------- подсчёт нафармленного ----------------
+    local lastStat = nil
+
+    local function textHas(s, words)
+        s = tostring(s or "")
+        for _, w in ipairs(words) do
+            if s:find(w, 1, true) then return true end
+        end
+        return false
+    end
+
+    local function statMatches(n)
+        if STAT_NAME then return n == STAT_NAME end
+        local l = n:lower()
+        for _, w in ipairs(STAT_WORDS) do
+            if n:find(w, 1, true) or l:find(w, 1, true) then return true end
+        end
+        return false
+    end
+
+    local function readStat()
+        local ls = player:FindFirstChild("leaderstats")
+        if ls then
+            for _, v in ipairs(ls:GetChildren()) do
+                if (v:IsA("IntValue") or v:IsA("NumberValue")) and statMatches(v.Name) then
+                    return v.Value, "leaderstats." .. v.Name
+                end
+            end
+        end
+        for k, v in pairs(player:GetAttributes()) do
+            if type(v) == "number" and statMatches(k) then
+                return v, "атрибут " .. k
+            end
+        end
+        return nil, nil
+    end
+
+    local function trackFarm()
+        local onT = false
+        if mode == "treadmill" and enabled then
+            local p = searchCache()
+            onT = p ~= nil and p.ActionText == ACTION_STOP
+        end
+        farmInfo.on = onT
+
+        local cur, name = readStat()
+        local gained = 0
+
+        if cur then
+            farmInfo.src = "игра: " .. tostring(name)
+            if lastStat and cur > lastStat and onT then
+                gained = cur - lastStat
+            end
+            lastStat = cur
+        else
+            lastStat = nil
+            farmInfo.src = "оценка " .. EXP_PER_SECOND .. "/сек"
+            if onT then gained = EXP_PER_SECOND end
+        end
+
+        if gained > 0 then
+            totalFarmed += gained
+        end
+
+        updateFarmLabel()
+    end
+
     ---------------- режим: дорожка ----------------
     local function ensureRunning(myCycle)
         setStatus("ищем дорожку")
@@ -359,21 +766,15 @@ local function main()
     end
 
     ---------------- такси: метки ----------------
-    local function nameMatches(name)
-        local l = name:lower()
-        for _, w in ipairs(MARKER_WORDS) do
-            if l:find(w, 1, true) or name:find(w, 1, true) then
-                return true
-            end
-        end
-        return false
-    end
-
     local function textMatches(t)
         for _, w in ipairs(TAXI_TEXT) do
             if t:find(w, 1, true) then return true end
         end
         return false
+    end
+
+    local function isYellow(c)
+        return c.R > 0.8 and c.G > 0.65 and c.B < 0.45
     end
 
     local function objectPosition(obj)
@@ -389,6 +790,19 @@ local function main()
         return nil
     end
 
+    local function billboardPos(g)
+        local p = objectPosition(g.Adornee)
+        if p then return p end
+        local cur = g.Parent
+        for _ = 1, 4 do
+            if not cur or cur == workspace then break end
+            p = objectPosition(cur)
+            if p then return p end
+            cur = cur.Parent
+        end
+        return nil
+    end
+
     local function billboardTexts(g)
         local out = {}
         for _, d in ipairs(g:GetDescendants()) do
@@ -399,15 +813,62 @@ local function main()
         return out
     end
 
-    -- Текст без цифр (чтобы меняющаяся дистанция не считалась сменой метки)
-    local function stableText(g)
-        local s = table.concat(billboardTexts(g), "|")
-        return (s:gsub("[%d%.]+", "#"))
+    local function normText(s)
+        s = tostring(s or "")
+        s = s:gsub("<[^>]+>", "")
+        s = s:gsub("[%d%.,%s]+", "")
+        return s
     end
 
-    local function collectTargets()
-        local list, n = {}, 0
+    -- Задание на экране: текст и расстояние в метрах («9 м»)
+    local function readHud()
+        local pg = player:FindFirstChildOfClass("PlayerGui")
+        if not pg then return nil, nil end
+
+        local distLabel, dist
+        for _, g in ipairs(pg:GetDescendants()) do
+            if g:IsA("TextLabel") and not g:IsDescendantOf(gui)
+                and g.AbsoluteSize.X > 0 and guiVisible(g) then
+                local t = g.Text:gsub("<[^>]+>", "")
+                local n = t:match("^%s*(%d+[%.,]?%d*)%s*м%s*$")
+                if n then
+                    distLabel = g
+                    dist = tonumber((n:gsub(",", ".")))
+                    break
+                end
+            end
+        end
+        if not distLabel then return nil, nil end
+
+        local instr
+        local cur = distLabel.Parent
+        for _ = 1, 3 do
+            if not cur then break end
+            for _, d in ipairs(cur:GetDescendants()) do
+                if d:IsA("TextLabel") and d ~= distLabel and guiVisible(d) then
+                    local t = d.Text:gsub("<[^>]+>", "")
+                    if #t > 12 and (not instr or #t > #instr) then
+                        instr = t
+                    end
+                end
+            end
+            if instr then break end
+            cur = cur.Parent
+        end
+
+        return instr, dist
+    end
+
+    -- ignorePos: только что выполненная точка, её пропускаем
+    local function findTaxiTarget(ignorePos)
+        local instr, hud = readHud()
+        local want = instr and normText(instr) or nil
+        local root = getRoot()
         local char = player.Character
+
+        local exact, loose, yellow = {}, {}, {}
+        local n = 0
+
         pcall(function()
             for _, obj in ipairs(workspace:GetDescendants()) do
                 n += 1
@@ -415,64 +876,87 @@ local function main()
 
                 if obj:IsA("BillboardGui") then
                     if obj.Enabled then
-                        local hit = false
+                        local isExact, isLoose = false, false
                         for _, t in ipairs(billboardTexts(obj)) do
-                            if textMatches(t) then hit = true break end
+                            local nt = normText(t)
+                            if want and #want > 8 and #nt > 8 then
+                                if nt:find(want, 1, true)
+                                    or (want:find(nt, 1, true) and #nt >= #want - 6) then
+                                    isExact = true
+                                end
+                            end
+                            if textMatches(t) then isLoose = true end
                         end
-                        if hit then
-                            local pos = objectPosition(obj.Adornee or obj.Parent)
+                        if isExact or isLoose then
+                            local pos = billboardPos(obj)
                             if pos then
-                                table.insert(list, {obj = obj, pos = pos})
+                                table.insert(isExact and exact or loose, {
+                                    obj = obj,
+                                    pos = pos,
+                                    kind = isExact and "текст задания" or "слово",
+                                })
                             end
                         end
                     end
-                elseif (obj:IsA("BasePart") or obj:IsA("Attachment") or obj:IsA("Model"))
-                    and nameMatches(obj.Name)
+                elseif obj:IsA("BasePart")
+                    and obj.Material == Enum.Material.Neon
+                    and obj.Transparency < 0.95
+                    and isYellow(obj.Color)
+                    and (obj.Size.X >= 12 or obj.Size.Z >= 12)
                     and not (char and obj:IsDescendantOf(char)) then
-                    local pos = objectPosition(obj)
-                    if pos then
-                        table.insert(list, {obj = obj, pos = pos})
-                    end
+                    table.insert(yellow, obj)
                 end
             end
         end)
-        return list
-    end
 
-    local function nearestTarget(list)
-        local best, bestD
-        for _, c in ipairs(list) do
-            local d = flatDistance(c.pos)
-            if not bestD or d < bestD then
-                best, bestD = c, d
+        local list = exact
+        if #list == 0 then list = loose end
+
+        if #list == 0 and not hud then
+            for _, p in ipairs(yellow) do
+                local dup = false
+                for _, c in ipairs(list) do
+                    if (c.pos - p.Position).Magnitude < 15 then dup = true break end
+                end
+                if not dup then
+                    table.insert(list, {obj = p, pos = p.Position, kind = "жёлтое кольцо"})
+                end
             end
         end
-        return best, bestD
-    end
 
-    local function targetSnapshot(t)
-        local o = t.obj
-        if not o or not o.Parent then
-            return {gone = true}
+        if ignorePos then
+            local filtered = {}
+            for _, c in ipairs(list) do
+                if (c.pos - ignorePos).Magnitude >= 15 then
+                    table.insert(filtered, c)
+                end
+            end
+            list = filtered
         end
-        if o:IsA("BillboardGui") then
-            if not o.Enabled then return {gone = true} end
-            return {
-                txt = stableText(o),
-                pos = objectPosition(o.Adornee or o.Parent) or t.pos
-            }
-        end
-        return {txt = "", pos = objectPosition(o) or t.pos}
-    end
 
-    local function targetChanged(t, first)
-        local now = targetSnapshot(t)
-        if now.gone then return true end
-        if now.txt ~= first.txt then return true end
-        if first.pos and now.pos and (now.pos - first.pos).Magnitude > 8 then
-            return true
+        if #list == 0 then
+            return nil, nil, list, instr, hud
         end
-        return false
+
+        local best, bestErr
+        for _, c in ipairs(list) do
+            local d = root and (c.pos - root.Position).Magnitude or 0
+            c.dist = d
+            local err = d
+            if hud then
+                err = math.huge
+                for _, k in ipairs({1, 0.28, 0.25}) do
+                    err = math.min(err, math.abs(d * k - hud))
+                end
+            end
+            if not bestErr or err < bestErr then
+                best, bestErr = c, err
+            end
+        end
+
+        best.instr = instr
+        best.hud = hud
+        return best, best.dist, list, instr, hud
     end
 
     ---------------- такси: машина ----------------
@@ -483,10 +967,6 @@ local function main()
         local model = seat:FindFirstAncestorOfClass("Model") or seat
         return model, seat
     end
-
-    -- Управление клавишами (W/A/S/D) + свойства VehicleSeat
-    local VIM = nil
-    pcall(function() VIM = game:GetService("VirtualInputManager") end)
 
     local keyState = {}
     local lastThrottle = 0
@@ -568,23 +1048,6 @@ local function main()
         return false
     end
 
-    -- Кнопка машины на экране
-    local function guiVisible(g)
-        local cur = g
-        local pg = player:FindFirstChildOfClass("PlayerGui")
-        while cur and cur ~= pg do
-            if cur:IsA("GuiObject") and not cur.Visible then return false end
-            if cur:IsA("ScreenGui") and not cur.Enabled then return false end
-            cur = cur.Parent
-        end
-        return true
-    end
-
-    local function viewportWidth()
-        local cam = workspace.CurrentCamera
-        return cam and cam.ViewportSize.X or 1000
-    end
-
     local function findCarButton()
         local pg = player:FindFirstChildOfClass("PlayerGui")
         if not pg then return nil end
@@ -619,31 +1082,6 @@ local function main()
             end
         end
         return nil
-    end
-
-    local function fireButton(b)
-        if typeof(firesignal) ~= "function" then return false end
-        for _, sig in ipairs({"MouseButton1Click", "Activated"}) do
-            pcall(function() firesignal(b[sig]) end)
-        end
-        return true
-    end
-
-    local function vimClick(b)
-        if not VIM then return false end
-        local inset = 0
-        local sg = b:FindFirstAncestorOfClass("ScreenGui")
-        if sg and not sg.IgnoreGuiInset then
-            inset = GuiService:GetGuiInset().Y
-        end
-        local x = b.AbsolutePosition.X + b.AbsoluteSize.X / 2
-        local y = b.AbsolutePosition.Y + b.AbsoluteSize.Y / 2 + inset
-        pcall(function()
-            VIM:SendMouseButtonEvent(x, y, 0, true, game, 1)
-            task.wait(0.05)
-            VIM:SendMouseButtonEvent(x, y, 0, false, game, 1)
-        end)
-        return true
     end
 
     local function waitNewSeat(before, timeout, myCycle)
@@ -688,11 +1126,9 @@ local function main()
         return hum.SeatPart ~= nil
     end
 
-    -- Вызвать машину кнопкой слева и сесть
     local function getCar(myCycle)
         local before = listSeats()
 
-        -- уже есть своя свободная машина?
         for seat in pairs(before) do
             if not seat.Occupant and seatIsMine(seat) then
                 setStatus("нашли свою машину")
@@ -724,7 +1160,7 @@ local function main()
         return boardSeat(seat, myCycle)
     end
 
-    -- Маршрут для машины (большой радиус агента)
+    ---------------- такси: езда по земле ----------------
     local function planPath(from, to)
         local pts = {}
         local path = PathfindingService:CreatePath({
@@ -740,12 +1176,12 @@ local function main()
                 if i > 1 then table.insert(pts, wp.Position) end
             end
         end
-        if #pts == 0 then pts = {to} end -- нет маршрута: едем напрямую
+        if #pts == 0 then pts = {to} end
         return pts
     end
 
-    -- Езда по земле к точке. true = доехали и остановились
-    local function driveTo(dest, myCycle)
+    -- Возвращает: доехали(bool), сигнал(строка или nil)
+    local function driveTo(dest, myCycle, watcher)
         local _, seat = getVehicle()
         if not seat then return false end
 
@@ -780,7 +1216,6 @@ local function main()
             end
             look = look.Unit * fwdSign
 
-            -- авто-калибровка: куда у этой машины "перёд"
             if speed > 12 and lastThrottle > 0 then
                 if flatVel.Unit:Dot(look) < -0.5 then
                     fwdSign = -fwdSign
@@ -790,12 +1225,27 @@ local function main()
 
             local distFinal = Vector3.new(pos.X - dest.X, 0, pos.Z - dest.Z).Magnitude
 
-            -- приехали: тормозим и стоим
+            -- рядом с кольцом следим за пассажиром
+            if watcher and distFinal < 25 then
+                local r = watcher()
+                if r then
+                    releaseAll()
+                    return true, r
+                end
+            end
+
             if distFinal < 9 then
                 local t0 = os.clock()
                 while alive(myCycle) and os.clock() - t0 < 4 do
                     local _, s2 = getVehicle()
                     if not s2 then break end
+                    if watcher then
+                        local r = watcher()
+                        if r then
+                            releaseAll()
+                            return true, r
+                        end
+                    end
                     local v2 = s2.AssemblyLinearVelocity
                     if Vector3.new(v2.X, 0, v2.Z).Magnitude < 2 then break end
                     drive(-1, 0)
@@ -805,14 +1255,12 @@ local function main()
                 return alive(myCycle)
             end
 
-            -- перестраиваем маршрут раз в 15 секунд
             if os.clock() - lastPlan > 15 then
                 pts = planPath(pos, dest)
                 idx = 1
                 lastPlan = os.clock()
             end
 
-            -- следующая точка маршрута
             if idx < #pts then
                 local w = pts[idx]
                 if Vector3.new(pos.X - w.X, 0, pos.Z - w.Z).Magnitude < 14 then
@@ -827,7 +1275,6 @@ local function main()
             end
             dir = dir.Unit
 
-            -- руль: cross > 0 значит цель слева
             local cross = look.Z * dir.X - look.X * dir.Z
             local dot = look:Dot(dir)
             local steer = math.clamp(-cross * 2.5, -1, 1)
@@ -835,7 +1282,6 @@ local function main()
                 steer = (cross >= 0) and -1 or 1
             end
 
-            -- газ: скорость зависит от расстояния до цели
             local maxSpeed = math.clamp(distFinal * 0.8, 12, 70)
             if dot < 0.3 then maxSpeed = math.min(maxSpeed, 25) end
 
@@ -846,7 +1292,6 @@ local function main()
                 throttle = 0
             end
 
-            -- застряли
             if throttle > 0 and speed < 2 then
                 stuckSince = stuckSince or os.clock()
                 if os.clock() - stuckSince > 2.5 then
@@ -881,18 +1326,371 @@ local function main()
         return false
     end
 
+    ---------------- такси: полёт (сквозь стены, низко над дорогой) ----------------
+    local NPC_RADIUS = 20
+
+    local function isOtherPlayerChar(m)
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl.Character == m then return true end
+        end
+        return false
+    end
+
+    local function collectNoclipParts(model, seat)
+        local set = {}
+
+        local function addTree(root)
+            if not root then return end
+            if root:IsA("BasePart") then set[root] = true end
+            for _, p in ipairs(root:GetDescendants()) do
+                if p:IsA("BasePart") then set[p] = true end
+            end
+        end
+
+        addTree(model)
+        addTree(player.Character)
+
+        if seat then
+            pcall(function()
+                for _, p in ipairs(seat:GetConnectedParts(true)) do
+                    set[p] = true
+                end
+            end)
+
+            pcall(function()
+                local near = workspace:GetPartBoundsInRadius(seat.Position, NPC_RADIUS)
+                local seen = {}
+                for _, p in ipairs(near) do
+                    local m = p:FindFirstAncestorOfClass("Model")
+                    if m and not seen[m] then
+                        seen[m] = true
+                        local h = m:FindFirstChildOfClass("Humanoid")
+                        if h and not isOtherPlayerChar(m) and m ~= player.Character then
+                            local sp = h.SeatPart
+                            if sp and (sp == seat or (model and sp:IsDescendantOf(model))) then
+                                addTree(m)
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+
+        return set
+    end
+
+    local function refreshNoclip(model, seat, set, store)
+        local fresh = collectNoclipParts(model, seat)
+        for p in pairs(fresh) do
+            if not set[p] then
+                set[p] = true
+                if store[p] == nil then store[p] = p.CanCollide end
+            end
+        end
+    end
+
+    local function restoreNoclip(store)
+        for p, was in pairs(store) do
+            if p.Parent then
+                pcall(function() p.CanCollide = was end)
+            end
+        end
+    end
+
+    local function groundBelow(pos, ignore, up, len)
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = ignore
+        pcall(function() params.RespectCanCollide = true end)
+        local res = workspace:Raycast(
+            pos + Vector3.new(0, up, 0),
+            Vector3.new(0, -len, 0),
+            params
+        )
+        return res and res.Position.Y or nil
+    end
+
+    -- Возвращает: долетели(bool), сигнал(строка или nil)
+    local function flyTo(dest, myCycle, radius, watcher)
+        local model, seat = getVehicle()
+        if not seat then return false end
+
+        releaseAll()
+        radius = radius or 6
+
+        local store = {}
+        local noclipSet = {}
+        local arrived = false
+        local signal = nil
+
+        local conn = RunService.Stepped:Connect(function()
+            for p in pairs(noclipSet) do
+                if p.Parent and p.CanCollide then
+                    p.CanCollide = false
+                end
+            end
+        end)
+
+        local ok = pcall(function()
+            local ignore = {model, player.Character}
+            local destGround = groundBelow(dest, ignore, 60, 300) or dest.Y
+            local lastGround = groundBelow(seat.Position, ignore, 4, 40) or seat.Position.Y
+
+            refreshNoclip(model, seat, noclipSet, store)
+
+            local started = os.clock()
+            local lastStatus = 0
+            local lastNoclip = os.clock()
+
+            while alive(myCycle) and os.clock() - started < 90 do
+                local m, s = getVehicle()
+                if not s then return end
+
+                if os.clock() - lastNoclip > 0.3 then
+                    lastNoclip = os.clock()
+                    refreshNoclip(m, s, noclipSet, store)
+                end
+
+                local pos = s.Position
+                local flat = Vector3.new(dest.X - pos.X, 0, dest.Z - pos.Z)
+                local d = flat.Magnitude
+
+                -- рядом с кольцом следим за пассажиром
+                if watcher and d < 22 then
+                    local r = watcher()
+                    if r then
+                        signal = r
+                        arrived = true
+                        break
+                    end
+                end
+
+                if d < radius then
+                    arrived = true
+                    break
+                end
+
+                local dir = flat.Unit
+
+                local g = groundBelow(pos, ignore, 4, 40)
+                if g then lastGround = g end
+                local yWant = lastGround + FLY_HEIGHT
+                if d < 25 then
+                    yWant = destGround + FLY_HEIGHT
+                end
+
+                local spd = math.clamp(d * 1.5, 18, 95)
+                local vy = math.clamp((yWant - pos.Y) * 6, -60, 60)
+
+                s.AssemblyLinearVelocity = dir * spd + Vector3.new(0, vy, 0)
+                s.AssemblyAngularVelocity = Vector3.zero
+
+                pcall(function()
+                    local p = m:GetPivot().Position
+                    m:PivotTo(CFrame.lookAt(p, p + dir))
+                end)
+
+                if os.clock() - lastStatus > 1 then
+                    lastStatus = os.clock()
+                    setStatus("летим: " .. math.floor(d) .. " ст.")
+                end
+
+                RunService.Heartbeat:Wait()
+            end
+        end)
+
+        conn:Disconnect()
+
+        local _, s0 = getVehicle()
+        if s0 then
+            pcall(function()
+                s0.AssemblyLinearVelocity = Vector3.zero
+                s0.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+        restoreNoclip(store)
+
+        if not ok then
+            setStatus("ошибка полёта")
+            return false
+        end
+        if signal then
+            return true, signal
+        end
+        if not arrived then
+            return false
+        end
+
+        -- стоим в кольце, но выходим сразу, как только увидели сигнал
+        setStatus("стоим в кольце")
+        local t0 = os.clock()
+        while alive(myCycle) and os.clock() - t0 < 1.5 do
+            local _, s = getVehicle()
+            if not s then return false end
+
+            if watcher then
+                local r = watcher()
+                if r then return true, r end
+            end
+
+            local v = s.AssemblyLinearVelocity
+            s.AssemblyLinearVelocity = Vector3.new(0, v.Y, 0)
+            s.AssemblyAngularVelocity = Vector3.zero
+            RunService.Heartbeat:Wait()
+        end
+
+        return alive(myCycle), nil
+    end
+
+    local function travelTo(dest, myCycle, radius, watcher)
+        if flyMode then
+            return flyTo(dest, myCycle, radius, watcher)
+        end
+        return driveTo(dest, myCycle, watcher)
+    end
+
+    ---------------- такси: слежение за пассажиром ----------------
+    -- Все не-игровые персонажи (с Humanoid) в радиусе от точки
+    local function nonPlayerHumanoidModels(center, radius)
+        local out = {}
+        pcall(function()
+            local near = workspace:GetPartBoundsInRadius(center, radius)
+            local seen = {}
+            for _, p in ipairs(near) do
+                local m = p:FindFirstAncestorOfClass("Model")
+                if m and not seen[m] and m ~= player.Character then
+                    seen[m] = true
+                    local h = m:FindFirstChildOfClass("Humanoid")
+                    local r = m:FindFirstChild("HumanoidRootPart") or m.PrimaryPart
+                    if h and r and not isOtherPlayerChar(m) then
+                        out[m] = {hum = h, root = r}
+                    end
+                end
+            end
+        end)
+        return out
+    end
+
+    -- Сидит ли в нашей машине кто-то (пассажир)
+    local function passengerInCar()
+        local model, seat = getVehicle()
+        if not seat then return false end
+
+        local connected = {}
+        pcall(function()
+            for _, p in ipairs(seat:GetConnectedParts(true)) do
+                connected[p] = true
+            end
+        end)
+
+        for _, info in pairs(nonPlayerHumanoidModels(seat.Position, 25)) do
+            local sp = info.hum.SeatPart
+            if sp and (sp == seat or connected[sp] or (model and sp:IsDescendantOf(model))) then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Наблюдатель: возвращает строку с причиной, когда пассажир сел/вышел/задание сменилось
+    local function makeWatcher(best, firstKey, hadHud)
+        local startSeated = passengerInCar()
+        local sample1, baseline = nil, nil
+        local sampleAt = 0
+        local lastCheck = 0
+        local result = nil
+
+        return function()
+            if result then return result end
+            if os.clock() - lastCheck < 0.12 then return nil end
+            lastCheck = os.clock()
+
+            -- 1) задание на экране
+            local instr, hud = readHud()
+            if hadHud and not hud then
+                result = "задание пропало"
+                return result
+            end
+            if instr and firstKey ~= "" and normText(instr) ~= firstKey then
+                result = "задание сменилось"
+                return result
+            end
+
+            -- 2) метка в мире
+            local o = best.obj
+            if not o or not o.Parent then
+                result = "метка исчезла"
+                return result
+            end
+            if o:IsA("BillboardGui") and not o.Enabled then
+                result = "метка исчезла"
+                return result
+            end
+
+            -- 3) пассажир сел / вышел
+            local seated = passengerInCar()
+            if seated ~= startSeated then
+                result = seated and "пассажир сел" or "пассажир вышел"
+                return result
+            end
+
+            -- 4) тот, кто стоял в кольце, пропал или ушёл
+            local _, seat = getVehicle()
+            if seat and (seat.Position - best.pos).Magnitude < 18 then
+                if not sample1 then
+                    sample1 = {}
+                    for m, info in pairs(nonPlayerHumanoidModels(best.pos, 14)) do
+                        sample1[m] = {root = info.root, pos = info.root.Position}
+                    end
+                    sampleAt = os.clock()
+                elseif not baseline then
+                    if os.clock() - sampleAt > 0.6 then
+                        baseline = {}
+                        for m, s in pairs(sample1) do
+                            -- берём только тех, кто стоит на месте
+                            if m.Parent and s.root.Parent
+                                and (s.root.Position - s.pos).Magnitude < 1.5 then
+                                baseline[m] = {root = s.root, pos = s.root.Position}
+                            end
+                        end
+                    end
+                else
+                    for m, s in pairs(baseline) do
+                        if not m.Parent or not s.root.Parent
+                            or (s.root.Position - s.pos).Magnitude > 8 then
+                            result = "пассажира забрали"
+                            return result
+                        end
+                    end
+                end
+            end
+
+            return nil
+        end
+    end
+
+    local function waitSignal(watcher, timeout, myCycle)
+        local t0 = os.clock()
+        while alive(myCycle) and os.clock() - t0 < timeout do
+            local r = watcher()
+            if r then return r end
+            task.wait(0.1)
+        end
+        return nil
+    end
+
     ---------------- режим: такси ----------------
     local function taxiLoop(myCycle)
         timer.Text = "Таймер: --:--"
         local shiftDone = false
         local shiftAttempts = 0
         local shiftMisses = 0
+        local lastDone = nil -- {pos, t}
 
         while alive(myCycle) do
             local _, seat = getVehicle()
 
             if not seat then
-                -- 1) сначала садимся в машину (заказ можно брать только в ней)
                 releaseAll()
                 if getCar(myCycle) then
                     setStatus("в машине")
@@ -902,7 +1700,6 @@ local function main()
                 end
 
             elseif not shiftDone then
-                -- 2) уже в машине: едем к стойке и начинаем смену
                 local shift = findPromptBy(function(o) return o.ActionText == ACTION_SHIFT end)
 
                 if not shift then
@@ -918,8 +1715,8 @@ local function main()
                     local part = getPromptPart(shift)
 
                     if part then
-                        setStatus("едем к стойке такси")
-                        local arrived = driveTo(part.Position, myCycle)
+                        setStatus("к стойке такси")
+                        local arrived = travelTo(part.Position, myCycle, 6)
 
                         if arrived and alive(myCycle) then
                             shiftAttempts += 1
@@ -938,42 +1735,65 @@ local function main()
                 end
 
             else
-                -- 3) смена идёт: ездим по меткам
-                local best, dist = nearestTarget(collectTargets())
+                local ignore = nil
+                if lastDone and os.clock() - lastDone.t < 8 then
+                    ignore = lastDone.pos
+                end
+
+                local best, dist, _, instr, hud = findTaxiTarget(ignore)
 
                 if not best then
-                    setStatus("метка не найдена, жми ДАМП")
-                    task.wait(3)
+                    if hud and not ignore then
+                        setStatus("метка не найдена, на экране " .. hud .. " м (жми ДАМП)")
+                    else
+                        setStatus("жду следующий заказ")
+                    end
+                    task.wait(1)
                 else
-                    setStatus("метка " .. math.floor(dist) .. " м")
-                    local first = targetSnapshot(best)
+                    local isPickup = instr and instr:find("Забери", 1, true)
+                    local label = isPickup and "пассажир" or "высадка"
 
-                    if driveTo(best.pos, myCycle) then
-                        -- стоим в кольце, ждём пока метка сменится
-                        local changed = false
-                        local t0 = os.clock()
-                        while alive(myCycle) and os.clock() - t0 < 10 do
-                            if targetChanged(best, first) then
-                                changed = true
-                                break
+                    setStatus(label .. ": " .. math.floor(dist) .. " ст.")
+                    debugLabel.Text = "цель: " .. best.kind .. " / " .. best.obj.Name
+                        .. "\nна экране: " .. tostring(hud) .. " м"
+
+                    local firstKey = instr and normText(instr) or ""
+                    local hadHud = hud ~= nil
+                    local watcher = makeWatcher(best, firstKey, hadHud)
+
+                    local reached, reason = travelTo(best.pos, myCycle, 6, watcher)
+
+                    -- долетели, сигнала нет: ждём недолго, потом ближе к центру кольца
+                    if reached and not reason and alive(myCycle) then
+                        reason = waitSignal(watcher, 3, myCycle)
+
+                        if not reason and alive(myCycle) then
+                            setStatus("ближе к центру кольца")
+                            local reached2, reason2 = travelTo(best.pos, myCycle, 1.5, watcher)
+                            reason = reason2
+                            if reached2 and not reason then
+                                reason = waitSignal(watcher, 3, myCycle)
                             end
-                            task.wait(0.5)
                         end
+                    end
 
-                        if changed then
+                    if reason then
+                        if not isPickup then
                             cyclesCompleted += 1
                             cyclesLabel.Text = "Циклы: " .. cyclesCompleted
-                            setStatus("точка выполнена")
-                            task.wait(1.5)
-                        elseif alive(myCycle) then
-                            setStatus("метка не сменилась, пробуем ещё")
-                            task.wait(1)
                         end
+                        setStatus("OK: " .. reason)
+                        debugLabel.Text = "сигнал: " .. reason
+                        lastDone = {pos = best.pos, t = os.clock()}
+                        task.wait(0.5)
+                    elseif alive(myCycle) then
+                        setStatus("сигнала нет, пробуем ещё")
+                        task.wait(0.5)
                     end
                 end
             end
 
-            task.wait(0.3)
+            task.wait(0.1)
         end
 
         releaseAll()
@@ -985,14 +1805,78 @@ local function main()
         local function add(s) table.insert(lines, s) end
         local root = getRoot()
 
-        add("== машина ==")
-        local model, seat = getVehicle()
-        if model then
-            add("model=" .. model:GetFullName())
-            add("seat=" .. seat:GetFullName() .. " | " .. seat.ClassName)
+        add("== пассажир ==")
+        local model0, seat0 = getVehicle()
+        if seat0 then
+            add("в машине по SeatPart: " .. tostring(passengerInCar()))
+            local cnt = 0
+            for m, info in pairs(nonPlayerHumanoidModels(seat0.Position, 30)) do
+                cnt += 1
+                if cnt <= 10 then
+                    local sp = info.hum.SeatPart
+                    add(m:GetFullName() .. " | расстояние="
+                        .. math.floor((info.root.Position - seat0.Position).Magnitude)
+                        .. " | сидит=" .. tostring(sp and sp:GetFullName()))
+                end
+            end
+            if cnt == 0 then add("рядом (30 ст.) нет персонажей с Humanoid") end
         else
             add("игрок не в машине")
         end
+
+        add("== нафармленное: источник сейчас ==")
+        add(tostring(farmInfo.src))
+        local ls = player:FindFirstChild("leaderstats")
+        if ls then
+            for _, v in ipairs(ls:GetChildren()) do
+                add("leaderstats." .. v.Name .. " = " .. tostring(v.Value))
+            end
+        else
+            add("leaderstats нет")
+        end
+
+        add("== подписи на экране про опыт/хп/силу/уровень ==")
+        local statWords = {"EXP", "XP", "exp", "xp", "Опыт", "опыт", "ХП", "хп", "HP",
+            "Сила", "сила", "Уровень", "уровень"}
+        local sc = 0
+        pcall(function()
+            for _, g in ipairs(player.PlayerGui:GetDescendants()) do
+                if g:IsA("TextLabel") and not g:IsDescendantOf(gui)
+                    and g.AbsoluteSize.X > 0 and guiVisible(g) and textHas(g.Text, statWords) then
+                    sc += 1
+                    if sc <= 25 then
+                        add(g:GetFullName() .. " | " .. g.Text)
+                    end
+                end
+            end
+        end)
+
+        add("== машина ==")
+        if model0 then
+            add("model=" .. model0:GetFullName())
+            add("seat=" .. seat0:GetFullName() .. " | " .. seat0.ClassName)
+            local cnt = 0
+            for _ in pairs(collectNoclipParts(model0, seat0)) do cnt += 1 end
+            add("деталей в наборе noclip: " .. cnt)
+        else
+            add("игрок не в машине")
+        end
+
+        add("== задание на экране ==")
+        local instr, hud = readHud()
+        add("текст: " .. tostring(instr))
+        add("расстояние: " .. tostring(hud) .. " м")
+
+        add("== кандидаты метки ==")
+        local best, _, list = findTaxiTarget()
+        for i, c in ipairs(list) do
+            if i > 20 then break end
+            add(string.format("%s%s | %s | %s | %d ст.",
+                (c == best) and "[ВЫБРАНА] " or "",
+                c.kind, c.obj:GetFullName(), c.obj.ClassName,
+                math.floor(c.dist or flatDistance(c.pos))))
+        end
+        if #list == 0 then add("(пусто)") end
 
         add("== кнопки слева на экране ==")
         local w = viewportWidth()
@@ -1038,7 +1922,7 @@ local function main()
                 if obj:IsA("BillboardGui") then
                     local texts = billboardTexts(obj)
                     if #texts > 0 then
-                        local pos = objectPosition(obj.Adornee or obj.Parent)
+                        local pos = billboardPos(obj)
                         local d = pos and math.floor(flatDistance(pos)) or -1
                         if d == -1 or d <= 400 then
                             bb += 1
@@ -1053,38 +1937,27 @@ local function main()
             end
         end)
 
-        add("== цели такси (что видит скрипт) ==")
-        local count = 0
-        for _, c in ipairs(collectTargets()) do
-            count += 1
-            if count > 20 then break end
-            add(string.format("%s | %s | %d",
-                c.obj:GetFullName(), c.obj.ClassName, math.floor(flatDistance(c.pos))))
-        end
+        add("== жёлтые неоновые детали рядом (до 200 стадов) ==")
+        local yc = 0
+        pcall(function()
+            for _, obj in ipairs(workspace:GetDescendants()) do
+                if obj:IsA("BasePart") and obj.Material == Enum.Material.Neon
+                    and obj.Transparency < 1 and root and isYellow(obj.Color)
+                    and (obj.Position - root.Position).Magnitude <= 200 then
+                    yc += 1
+                    if yc <= 20 then
+                        add(obj:GetFullName() .. " | " .. obj.ClassName
+                            .. " | size=" .. tostring(obj.Size)
+                            .. " | " .. math.floor((obj.Position - root.Position).Magnitude))
+                    end
+                end
+            end
+        end)
 
         add("== атрибуты игрока ==")
         for k, v in pairs(player:GetAttributes()) do
             add(tostring(k) .. " = " .. tostring(v))
         end
-
-        add("== GUI с похожим текстом ==")
-        local words = {"Забр", "Высад", "ассажир", "Заказ", "акси", "Отвез"}
-        local guiCount = 0
-        pcall(function()
-            for _, g in ipairs(player.PlayerGui:GetDescendants()) do
-                if g:IsA("TextLabel") or g:IsA("TextButton") then
-                    for _, wd in ipairs(words) do
-                        if g.Text:find(wd, 1, true) then
-                            guiCount += 1
-                            if guiCount <= 30 then
-                                add(g:GetFullName() .. " | " .. g.Text)
-                            end
-                            break
-                        end
-                    end
-                end
-            end
-        end)
 
         return table.concat(lines, "\n")
     end
@@ -1163,6 +2036,11 @@ local function main()
         end
     end)
 
+    driveButton.MouseButton1Click:Connect(function()
+        flyMode = not flyMode
+        driveButton.Text = flyMode and "Езда: полёт" or "Езда: земля"
+    end)
+
     toggle.MouseButton1Click:Connect(function()
         enabled = not enabled
         if enabled then
@@ -1181,10 +2059,18 @@ local function main()
         if enabled then launch() end
     end)
 
+    -- счётчик нафармленного работает всегда, раз в секунду
+    task.spawn(function()
+        while gui.Parent do
+            pcall(trackFarm)
+            task.wait(1)
+        end
+    end)
+
     launch()
 end
 
 local ok, err = pcall(main)
 if not ok then
     status.Text = "Ошибка запуска: " .. tostring(err):sub(1, 50)
-end 
+end
